@@ -187,6 +187,28 @@ fn analyze_dir(langs: &Vec<Lang>, dir: &str) -> HashMap<Lang, Analysis> {
     dir_results
 }
 
+fn char_name(c: char) -> String {
+    match c {
+        ' ' => "space".to_owned(),
+        '\t' => "tab".to_owned(),
+        '\n' => "enter".to_owned(),
+        _ => format!("{}", c),
+    }
+}
+
+fn format_results(analysis: &Analysis) -> String {
+    let mut s = String::new();
+
+    let mut sorted: Vec<_> = analysis.char_counts.iter().collect::<Vec<_>>();
+    sorted.sort_by_key(|(_c, count)| *_c);
+
+    for (c, count) in sorted.iter() {
+        s += format!("{c}: {count}\n", c = char_name(**c), count = count).as_str();
+    }
+
+    s
+}
+
 fn main() {
     set_up_logging();
 
@@ -203,6 +225,11 @@ fn main() {
 
     let results = analyze_dir(&langs, root);
 
-    //TODO better result formatting
-    println!("Results:\n{:?}", results);
+    for (lang, analysis) in results.iter() {
+        println!("Language: {}", lang.name);
+        let r = format_results(&analysis);
+        for line in r.lines() {
+            println!("\t{}", line);
+        }
+    }
 }
