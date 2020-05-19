@@ -47,40 +47,89 @@ fn set_up_logging() {
 #[derive(Debug, Clone)]
 struct Analysis {
     pub char_counts: HashMap<char, i32>,
+    pub bigrams: HashMap<(char, char), i32>,
+    pub trigrams: HashMap<(char, char, char), i32>,
 }
 
 impl Analysis {
     pub fn new() -> Analysis {
         Analysis {
-            char_counts: HashMap::with_capacity(64), // 64 slots should be enough for the most common characters
+            char_counts: HashMap::new(),
+            bigrams: HashMap::new(),
+            trigrams: HashMap::new(),
         }
     }
 
-    fn record_char(&mut self, c: char, occurrences: i32) {
-        if c == '\r' {
-            trace!("dropping untypable char: {:?}", c);
-            return;
-        }
+    pub fn record_char(&mut self, c: char, occurrences: i32) {
+        Self::increment_count(c, occurrences, &mut self.char_counts);
+    }
 
-        if let Some(count) = self.char_counts.get_mut(&c) {
-            *count += occurrences;
+    pub fn record_bigram(&mut self, bigram: (char, char), occurrences: i32) {
+        Self::increment_count(bigram, occurrences, &mut self.bigrams);
+    }
+
+    pub fn record_trigram(&mut self, trigram: (char, char, char), occurrences: i32) {
+        Self::increment_count(trigram, occurrences, &mut self.trigrams);
+    }
+
+    pub fn incorporate(&mut self, other: &Self) {
+        for (k, count) in other.char_counts.iter() {
+            self.record_char(*k, *count);
+        }
+        for (k, count) in other.bigrams.iter() {
+            self.record_bigram(*k, *count);
+        }
+        for (k, count) in other.trigrams.iter() {
+            self.record_trigram(*k, *count);
+        }
+    }
+
+    fn increment_count<E: std::cmp::Eq + std::hash::Hash>(
+        x: E,
+        extra_count: i32,
+        map: &mut HashMap<E, i32>,
+    ) {
+        if let Some(count) = map.get_mut(&x) {
+            *count += extra_count;
         } else {
-            self.char_counts.insert(c, occurrences);
+            map.insert(x, extra_count);
         }
     }
+}
 
-    fn incorporate(&mut self, other: &Self) {
-        for (c, count) in other.char_counts.iter() {
-            self.record_char(*c, *count);
-        }
-    }
+fn is_untypeable_char(c: char) -> bool {
+    c == '\r'
 }
 
 fn analyze_file(contents: &str) -> Analysis {
     let mut r = Analysis::new();
 
-    for c in contents.chars() {
+    // a, b, and c are the last 2 chars plus the current one; can't use Rust's iter::window() when
+    // we want to get `char`s rather than bytes, because we can't get a slice of bytes from a str
+    let mut a = None;
+    let mut b = None;
+    for mut c in contents.chars() {
+        if is_untypeable_char(c) {
+            trace!("dropping untypable char: {:?}", c);
+            continue;
+        }
+
+        // lowercase characters are significantly more common in most programming languages (and
+        // natural languages), so it makes sense to normalize to lowercase rather than uppercase
+        if c.is_ascii_uppercase() {
+            c = c.to_ascii_lowercase();
+        }
+
         r.record_char(c, 1);
+        if let Some(b) = b {
+            r.record_bigram((b, c), 1);
+            if let Some(a) = a {
+                r.record_trigram((a, b, c), 1);
+            }
+        }
+
+        a = b;
+        b = Some(c);
     }
 
     r
@@ -200,11 +249,27 @@ fn char_name(c: char) -> String {
     }
 }
 
+fn format_record_results<K>(map: &HashMap<K, i32>) -> String {
+    format!(
+        "{total} total, {uniq} unique (case insensitive)",
+        total = map.values().sum::<i32>(),
+        uniq = map.len()
+    )
+}
+
 fn format_results(analysis: &Analysis) -> String {
-    let mut s = String::new();
+    let mut s = format!(
+        "Characters: {chars}
+Bigrams: {bigrams}
+Trigrams: {trigrams}
+",
+        chars = format_record_results(&analysis.char_counts),
+        bigrams = format_record_results(&analysis.bigrams),
+        trigrams = format_record_results(&analysis.trigrams)
+    );
 
     let mut sorted: Vec<_> = analysis.char_counts.iter().collect::<Vec<_>>();
-    sorted.sort_by_key(|(_c, count)| *_c);
+    sorted.sort_by_key(|(c, _count)| *c);
 
     for (c, count) in sorted.iter() {
         s += format!("{c}: {count}\n", c = char_name(**c), count = count).as_str();
@@ -225,12 +290,15 @@ fn main() {
     let root = args.get(1).expect("first argument must be path");
 
     //TODO add more languages
+    // https://github.com/BurntSushi/ripgrep/blob/master/crates/ignore/src/default_types.rs
+    // has a nice mapping
     let langs = vec![Lang::new("rust", vec![r".*\.rs$"])];
 
     let results = analyze_dir(&langs, root);
 
     for (lang, analysis) in results.iter() {
         println!("Language: {}", lang.name);
+
         let r = format_results(&analysis);
         for line in r.lines() {
             println!("\t{}", line);
