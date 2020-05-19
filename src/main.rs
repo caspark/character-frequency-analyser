@@ -142,6 +142,10 @@ fn analyze_dir(langs: &Vec<Lang>, dir: &str) -> HashMap<Lang, Analysis> {
                 return None;
             }
             let filename = unixy_filename_of(&entry);
+
+            // TODO: use the `ignore` crate instead and replace this with a Types specification
+            // https://docs.rs/ignore/0.4.15/ignore/types/struct.TypesBuilder.html
+            // (maybe also make the iteration happen in parallel while we're at it)
             let matching_langs: Vec<&Lang> = langs
                 .iter()
                 .filter(|lang| lang.matches_file(filename.as_ref()))
