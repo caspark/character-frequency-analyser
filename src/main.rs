@@ -57,6 +57,11 @@ impl Analysis {
     }
 
     fn record_char(&mut self, c: char, occurrences: i32) {
+        if c == '\r' {
+            trace!("dropping untypable char: {:?}", c);
+            return;
+        }
+
         if let Some(count) = self.char_counts.get_mut(&c) {
             *count += occurrences;
         } else {
