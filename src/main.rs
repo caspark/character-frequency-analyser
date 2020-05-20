@@ -249,30 +249,39 @@ fn char_name(c: char) -> String {
     }
 }
 
-fn format_record_results<K>(map: &HashMap<K, i32>) -> String {
-    format!(
-        "{total} total, {uniq} unique (case insensitive)",
-        total = map.values().sum::<i32>(),
-        uniq = map.len()
-    )
-}
-
 fn format_results(analysis: &Analysis) -> String {
+    let c_total = analysis.char_counts.values().sum::<i32>();
+    let bi_total = analysis.bigrams.values().sum::<i32>();
+    let tri_total = analysis.trigrams.values().sum::<i32>();
+
     let mut s = format!(
-        "Characters: {chars}
-Bigrams: {bigrams}
-Trigrams: {trigrams}
+        "Characters: {c_total} total, {c_uniq} unique (case insensitive)
+Bigrams: {bi_total} total, {bi_uniq} unique
+Trigrams: {tri_total} total, {tri_uniq} unique
 ",
-        chars = format_record_results(&analysis.char_counts),
-        bigrams = format_record_results(&analysis.bigrams),
-        trigrams = format_record_results(&analysis.trigrams)
+        c_total = c_total,
+        c_uniq = analysis.char_counts.len(),
+        bi_total = bi_total,
+        bi_uniq = analysis.bigrams.len(),
+        tri_total = tri_total,
+        tri_uniq = analysis.trigrams.len(),
     );
 
-    let mut sorted: Vec<_> = analysis.char_counts.iter().collect::<Vec<_>>();
-    sorted.sort_by_key(|(c, _count)| *c);
+    let mut sorted: Vec<_> = analysis
+        .char_counts
+        .iter()
+        .map(|(c, count)| (c, count, *count as f32 * 100.0 / c_total as f32))
+        .collect::<Vec<_>>();
+    sorted.sort_by_key(|(_c, count, ..)| -*count);
 
-    for (c, count) in sorted.iter() {
-        s += format!("{c}: {count}\n", c = char_name(**c), count = count).as_str();
+    for (c, count, perc) in sorted.iter() {
+        s += format!(
+            "{c:>5} {count:>8}  {perc:05.2}%\n",
+            c = char_name(**c),
+            count = count,
+            perc = perc
+        )
+        .as_str();
     }
 
     s
