@@ -1,16 +1,18 @@
-use regex::Regex;
+use ignore::types::TypesBuilder;
+use ignore::WalkBuilder;
 use std::borrow::Cow;
 use std::collections::HashMap;
 use std::env;
-use walkdir::WalkDir;
 
 use fern::colors::{Color, ColoredLevelConfig};
 #[allow(unused_imports)]
 use log::{debug, error, info, trace, warn};
 
-/// Get the filename of an entry from a directory walk, with backslashes replaced with forward slashes
-fn unixy_filename_of(entry: &walkdir::DirEntry) -> String {
-    return entry.path().display().to_string().replace("\\", "/");
+mod default_types;
+
+/// Get the filename of a path, with backslashes replaced with forward slashes
+fn unixy_filename_of(path: &std::path::Path) -> String {
+    return path.display().to_string().replace("\\", "/");
 }
 
 fn set_up_logging() {
@@ -35,7 +37,7 @@ fn set_up_logging() {
         .level(log::LevelFilter::Warn)
         .level_for(
             env!("CARGO_PKG_NAME").replace("-", "_"),
-            log::LevelFilter::Trace,
+            log::LevelFilter::Debug,
         )
         .chain(std::io::stderr())
         .apply()
@@ -82,6 +84,10 @@ impl Analysis {
         for (k, count) in other.trigrams.iter() {
             self.record_trigram(*k, *count);
         }
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.char_counts.is_empty()
     }
 
     fn increment_count<E: std::cmp::Eq + std::hash::Hash>(
@@ -138,27 +144,15 @@ fn analyze_file(contents: &str) -> Analysis {
 #[derive(Debug, Clone)]
 struct Lang {
     name: String,
-    patterns: Vec<Regex>,
+    globs: Vec<String>,
 }
 
 impl Lang {
-    pub fn new(name: &str, patterns: Vec<&str>) -> Lang {
+    pub fn new(name: &str, globs: &[String]) -> Lang {
         Lang {
             name: name.to_owned(),
-            patterns: patterns
-                .iter()
-                .map(|p| Regex::new(p).expect("lang pattern must be valid"))
-                .collect(),
+            globs: globs.to_vec(),
         }
-    }
-
-    pub fn matches_file(&self, filename: &str) -> bool {
-        for pattern in self.patterns.iter() {
-            if pattern.is_match(filename) {
-                return true;
-            }
-        }
-        false
     }
 }
 
@@ -176,64 +170,79 @@ impl PartialEq for Lang {
 impl Eq for Lang {}
 
 fn analyze_dir(langs: &Vec<Lang>, dir: &str) -> HashMap<Lang, Analysis> {
+    let lang_name_to_lang: HashMap<&str, &Lang> = langs
+        .iter()
+        .map(|lang| (lang.name.as_str(), lang))
+        .collect::<HashMap<_, _>>();
+
     let mut dir_results: HashMap<Lang, Analysis> = langs
         .clone()
         .into_iter()
         .map(|lang| (lang, Analysis::new()))
         .collect();
 
-    for (lang, filename, entry) in WalkDir::new(dir)
-        .same_file_system(true)
-        .into_iter()
-        .map(|maybe_entry| maybe_entry.expect("able to read file"))
-        .filter_map(|entry| {
-            if !entry.file_type().is_file() {
-                return None;
-            }
-            let filename = unixy_filename_of(&entry);
+    let mut tb = TypesBuilder::new();
+    for lang in langs {
+        for glob in &lang.globs {
+            tb.add(&lang.name, &glob)
+                .expect("adding type should not fail");
+            tb.select(&lang.name);
+        }
+    }
+    let types = tb
+        .build()
+        .expect("type builder construction shouldn't fail");
 
-            // TODO: use the `ignore` crate instead and replace this with a Types specification
-            // https://docs.rs/ignore/0.4.15/ignore/types/struct.TypesBuilder.html
-            // (maybe also make the iteration happen in parallel while we're at it)
-            let matching_langs: Vec<&Lang> = langs
-                .iter()
-                .filter(|lang| lang.matches_file(filename.as_ref()))
-                .collect();
-            if matching_langs.len() > 1 {
-                let err_msg = format!(
-                    "Multiple languages are configured to match the file: {}",
-                    filename
-                );
-                panic!(err_msg);
-            } else {
-                matching_langs
-                    .first()
-                    .map(|lang| (lang.clone(), filename, entry))
-            }
-        })
-    {
-        trace!("analysing {}", &filename);
-        match std::fs::read_to_string(entry.path()) {
-            Ok(file_contents) => {
-                let file_results = analyze_file(file_contents.as_str());
-                if let Some(lang_analysis) = dir_results.get_mut(lang) {
-                    lang_analysis.incorporate(&file_results);
+    //TODO build a parallel walker here instead
+    for result in WalkBuilder::new(dir).types(types.clone()).build() {
+        let direntry = result.expect("valid direntry");
+        let filename = unixy_filename_of(&direntry.path());
+        let is_dir = direntry.file_type().expect("valid file info").is_dir();
+        if is_dir {
+            trace!("now analysing files in directory {}", filename);
+            continue;
+        }
+
+        let mat = types.matched(
+            direntry.path(),
+            direntry.file_type().expect("valid file info").is_dir(),
+        );
+
+        if let Some(lang_name) = mat
+            .inner()
+            .and_then(|glob| glob.file_type_def())
+            .map(|ftd| ftd.name())
+        {
+            let lang = lang_name_to_lang[lang_name];
+
+            trace!("now analysing {}", &filename);
+            match std::fs::read_to_string(direntry.path()) {
+                Ok(file_contents) => {
+                    let file_results = analyze_file(file_contents.as_str());
+                    if let Some(lang_analysis) = dir_results.get_mut(&lang) {
+                        lang_analysis.incorporate(&file_results);
+                    }
+                }
+                Err(err) => {
+                    let tip = if filename.len() > 260 {
+                        // path is longer than normal windows limit - long path support might need to be enabled
+                        Some(Cow::from(format!(". NB: path length of {len} is greater than 260 limit; you might need to enable the 'Enable Win32 long paths' group policy setting", len = filename.len())))
+                    } else {
+                        None
+                    };
+                    error!(
+                        "Error failed to analyse file {path}: {err:?}{tip}",
+                        err = err,
+                        tip = tip.unwrap_or(Cow::from("")),
+                        path = filename
+                    );
                 }
             }
-            Err(err) => {
-                let tip = if filename.len() > 260 {
-                    // path is longer than normal windows limit - long path support might need to be enabled
-                    Some(Cow::from(format!("NB: path length of {len} is greater than 260 limit; you might need to enable the 'Enable Win32 long paths' group policy setting", len = filename.len())))
-                } else {
-                    None
-                };
-                eprintln!(
-                    "Error:{err:?}{tip}  {path}",
-                    err = err,
-                    tip = tip.unwrap_or(Cow::from("")),
-                    path = filename
-                );
-            }
+        } else {
+            warn!(
+                "Received file that does not match type filter! {}",
+                filename
+            )
         }
     }
 
@@ -298,17 +307,18 @@ fn main() {
     }
     let root = args.get(1).expect("first argument must be path");
 
-    //TODO add more languages
-    // https://github.com/BurntSushi/ripgrep/blob/master/crates/ignore/src/default_types.rs
-    // has a nice mapping
-    let langs = vec![
-        Lang::new("rust", vec![r".*\.rs$"]),
-        Lang::new("python", vec![r".*\.py$"]),
-    ];
+    let langs = default_types::DEFAULT_TYPES
+        .iter()
+        .map(|(filetype, exts)| {
+            let es = exts.iter().map(|e| e.to_string()).collect::<Vec<_>>();
+            Lang::new(filetype, es.as_ref())
+        })
+        .collect();
 
     let results = analyze_dir(&langs, root);
 
-    for (lang, analysis) in results.iter() {
+    //TODO display aggregate stats for all languages combined
+    for (lang, analysis) in results.iter().filter(|(_l, a)| !a.is_empty()) {
         println!("Language: {}", lang.name);
 
         let r = format_results(&analysis);
