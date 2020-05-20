@@ -301,7 +301,10 @@ fn main() {
     //TODO add more languages
     // https://github.com/BurntSushi/ripgrep/blob/master/crates/ignore/src/default_types.rs
     // has a nice mapping
-    let langs = vec![Lang::new("rust", vec![r".*\.rs$"])];
+    let langs = vec![
+        Lang::new("rust", vec![r".*\.rs$"]),
+        Lang::new("python", vec![r".*\.py$"]),
+    ];
 
     let results = analyze_dir(&langs, root);
 
