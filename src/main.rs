@@ -169,7 +169,6 @@ impl Eq for Lang {}
 #[derive(Debug)]
 struct Analyzer<'l> {
     types: ignore::types::Types,
-    langs: &'l Vec<Lang>,
     dir_results: HashMap<Lang, Analysis>,
     lang_name_to_lang: HashMap<&'l str, &'l Lang>,
     final_results: &'l Mutex<HashMap<Lang, Analysis>>,
@@ -257,7 +256,6 @@ impl AnalyzerBuilder<'_> {
         AnalyzerBuilder {
             analyzer_prototype: Analyzer {
                 types: types.clone(),
-                langs: langs,
                 lang_name_to_lang: langs
                     .iter()
                     .map(|lang| (lang.name.as_str(), lang))
@@ -280,7 +278,6 @@ impl<'l> ignore::ParallelVisitorBuilder<'l> for AnalyzerBuilder<'l> {
             dir_results: self.analyzer_prototype.dir_results.clone(),
             types: self.analyzer_prototype.types.clone(),
             lang_name_to_lang: self.analyzer_prototype.lang_name_to_lang.clone(),
-            langs: self.analyzer_prototype.langs,
             final_results: self.analyzer_prototype.final_results,
         })
     }
