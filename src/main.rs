@@ -9,8 +9,6 @@ use fern::colors::{Color, ColoredLevelConfig};
 #[allow(unused_imports)]
 use log::{debug, error, info, trace, warn};
 
-mod default_types;
-
 /// Get the filename of a path, with backslashes replaced with forward slashes
 fn unixy_filename_of(path: &std::path::Path) -> String {
     return path.display().to_string().replace("\\", "/");
@@ -104,40 +102,11 @@ impl Analysis {
     }
 }
 
-#[derive(Debug, Clone)]
-struct Lang {
-    name: String,
-    globs: Vec<String>,
-}
-
-impl Lang {
-    pub fn new(name: &str, globs: &[String]) -> Lang {
-        Lang {
-            name: name.to_owned(),
-            globs: globs.to_vec(),
-        }
-    }
-}
-
-impl std::hash::Hash for Lang {
-    fn hash<H: std::hash::Hasher>(&self, state: &mut H) {
-        self.name.hash(state);
-    }
-}
-
-impl PartialEq for Lang {
-    fn eq(&self, other: &Self) -> bool {
-        self.name == other.name
-    }
-}
-impl Eq for Lang {}
-
 #[derive(Debug)]
 struct Analyzer<'l> {
-    types: ignore::types::Types,
-    dir_results: HashMap<Lang, Analysis>,
-    lang_name_to_lang: HashMap<&'l str, &'l Lang>,
-    final_results: &'l Mutex<HashMap<Lang, Analysis>>,
+    types: &'l ignore::types::Types,
+    dir_results: HashMap<String, Analysis>,
+    final_results: &'l Mutex<HashMap<String, Analysis>>,
 }
 
 impl Analyzer<'_> {
@@ -176,7 +145,7 @@ impl Analyzer<'_> {
     }
 }
 
-impl ignore::ParallelVisitor for Analyzer<'_> {
+impl<'l> ignore::ParallelVisitor for Analyzer<'l> {
     fn visit(&mut self, result: Result<ignore::DirEntry, ignore::Error>) -> ignore::WalkState {
         let direntry = result.expect("valid direntry");
         let filename = unixy_filename_of(&direntry.path());
@@ -189,19 +158,20 @@ impl ignore::ParallelVisitor for Analyzer<'_> {
                 direntry.file_type().expect("valid file info").is_dir(),
             );
 
-            if let Some(lang_name) = mat
+            if let Some(lang) = mat
                 .inner()
                 .and_then(|glob| glob.file_type_def())
                 .map(|ftd| ftd.name())
             {
-                let lang = self.lang_name_to_lang[lang_name];
-
                 trace!("now analysing {}", &filename);
                 match std::fs::read_to_string(direntry.path()) {
                     Ok(file_contents) => {
-                        let file_results = Self::analyze_file(file_contents.as_str());
-                        if let Some(lang_analysis) = self.dir_results.get_mut(&lang) {
-                            lang_analysis.incorporate(&file_results);
+                        let file_analysis = Self::analyze_file(file_contents.as_str());
+                        if let Some(existing_analysis) = self.dir_results.get_mut(lang) {
+                            existing_analysis.incorporate(&file_analysis)
+                        } else {
+                            self.dir_results
+                                .insert(lang.to_owned(), file_analysis.clone());
                         }
                     }
                     Err(err) => {
@@ -235,9 +205,13 @@ impl<'l> Drop for Analyzer<'l> {
     fn drop(&mut self) {
         trace!("Dropping analyzer and combining results");
         let lock_result = self.final_results.lock();
-        if let Ok(mut results_guard) = lock_result {
-            for (lang, results) in results_guard.iter_mut() {
-                results.incorporate(&self.dir_results[&lang]);
+        if let Ok(mut final_results_guard) = lock_result {
+            for (lang, analysis) in &self.dir_results {
+                if let Some(existing_analysis) = final_results_guard.get_mut(lang) {
+                    existing_analysis.incorporate(analysis)
+                } else {
+                    final_results_guard.insert(lang.clone(), analysis.clone());
+                }
             }
         } else {
             panic!("analyzer sees that mutex for collating results has been poisoned")
@@ -249,24 +223,15 @@ struct AnalyzerBuilder<'l> {
     analyzer_prototype: Analyzer<'l>,
 }
 
-impl AnalyzerBuilder<'_> {
-    pub fn new<'l>(
-        langs: &'l Vec<Lang>,
-        types: &ignore::types::Types,
-        final_results: &'l Mutex<HashMap<Lang, Analysis>>,
+impl<'l> AnalyzerBuilder<'l> {
+    pub fn new(
+        types: &'l ignore::types::Types,
+        final_results: &'l Mutex<HashMap<String, Analysis>>,
     ) -> AnalyzerBuilder<'l> {
         AnalyzerBuilder {
             analyzer_prototype: Analyzer {
-                types: types.clone(),
-                lang_name_to_lang: langs
-                    .iter()
-                    .map(|lang| (lang.name.as_str(), lang))
-                    .collect::<HashMap<_, _>>(),
-                dir_results: langs
-                    .clone()
-                    .into_iter()
-                    .map(|lang| (lang, Analysis::new()))
-                    .collect(),
+                types: types,
+                dir_results: HashMap::new(),
                 final_results: final_results,
             },
         }
@@ -278,44 +243,25 @@ impl<'l> ignore::ParallelVisitorBuilder<'l> for AnalyzerBuilder<'l> {
         trace!("Building new analyzer");
         Box::new(Analyzer {
             dir_results: self.analyzer_prototype.dir_results.clone(),
-            types: self.analyzer_prototype.types.clone(),
-            lang_name_to_lang: self.analyzer_prototype.lang_name_to_lang.clone(),
+            types: self.analyzer_prototype.types,
             final_results: self.analyzer_prototype.final_results,
         })
     }
 }
 
-fn analyze_dir(langs: &Vec<Lang>, dir: &str) -> HashMap<Lang, Analysis> {
-    let mut tb = TypesBuilder::new();
-    for lang in langs {
-        for glob in &lang.globs {
-            tb.add(&lang.name, &glob)
-                .expect("adding type should not fail");
-            tb.select(&lang.name);
-        }
+fn analyze_dir<'l>(types: &ignore::types::Types, dir: &str) -> HashMap<String, Analysis> {
+    let final_results = std::sync::Mutex::new(HashMap::new());
+
+    {
+        let mut analyzer_builder = AnalyzerBuilder::new(&types, &final_results);
+        WalkBuilder::new(dir)
+            .types(types.clone())
+            .build_parallel()
+            .visit(&mut analyzer_builder);
     }
-    let types = tb
-        .build()
-        .expect("type builder construction shouldn't fail");
 
-    let dir_results: HashMap<Lang, Analysis> = langs
-        .clone()
-        .into_iter()
-        .map(|lang| (lang, Analysis::new()))
-        .collect();
-
-    let final_results = std::sync::Mutex::new(dir_results.clone());
-
-    let mut analyzer_builder = AnalyzerBuilder::new(&langs, &types, &final_results);
-
-    WalkBuilder::new(dir)
-        .types(types.clone())
-        .build_parallel()
-        .visit(&mut analyzer_builder);
-
-    let lock_result = final_results.lock();
-    if let Ok(results_guard) = lock_result {
-        return results_guard.clone();
+    if let Ok(results_guard) = final_results.into_inner() {
+        return results_guard;
     } else {
         panic!("main thread sees that mutex for collating results has been poisoned")
     }
@@ -379,20 +325,19 @@ fn main() {
     }
     let root = args.get(1).expect("first argument must be path");
 
-    let langs = default_types::DEFAULT_TYPES
-        .iter()
-        .map(|(filetype, exts)| {
-            let es = exts.iter().map(|e| e.to_string()).collect::<Vec<_>>();
-            Lang::new(filetype, es.as_ref())
-        })
-        .collect();
+    let types = TypesBuilder::new()
+        // adds the types at https://github.com/BurntSushi/ripgrep/blob/master/crates/ignore/src/default_types.rs
+        .add_defaults()
+        .select("all") // enable all file types that are configured by default
+        .build()
+        .expect("type builder construction shouldn't fail");
 
-    let results = analyze_dir(&langs, root);
+    let results = analyze_dir(&types, root);
 
     //TODO display aggregate stats for all languages combined
     trace!("Analysis complete - now showing results");
     for (lang, analysis) in results.iter().filter(|(_l, a)| !a.is_empty()) {
-        println!("Language: {}", lang.name);
+        println!("Language: {}", lang);
 
         let r = format_results(&analysis);
         for line in r.lines() {
