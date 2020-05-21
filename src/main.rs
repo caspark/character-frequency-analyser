@@ -44,7 +44,7 @@ fn set_up_logging() {
         .apply()
         .unwrap();
 
-    debug!("finished setting up logging! yay!");
+    trace!("Logging configured");
 }
 
 #[derive(Debug, Clone)]
