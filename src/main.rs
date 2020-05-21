@@ -3,6 +3,7 @@ use ignore::WalkBuilder;
 use std::borrow::Cow;
 use std::collections::HashMap;
 use std::env;
+use std::sync::Mutex;
 
 use fern::colors::{Color, ColoredLevelConfig};
 #[allow(unused_imports)]
@@ -169,18 +170,127 @@ impl PartialEq for Lang {
 }
 impl Eq for Lang {}
 
+#[derive(Debug)]
+struct Analyzer<'l> {
+    types: ignore::types::Types,
+    langs: &'l Vec<Lang>,
+    dir_results: HashMap<Lang, Analysis>,
+    lang_name_to_lang: HashMap<&'l str, &'l Lang>,
+    final_results: &'l Mutex<HashMap<Lang, Analysis>>,
+}
+
+impl ignore::ParallelVisitor for Analyzer<'_> {
+    fn visit(&mut self, result: Result<ignore::DirEntry, ignore::Error>) -> ignore::WalkState {
+        let direntry = result.expect("valid direntry");
+        let filename = unixy_filename_of(&direntry.path());
+        let is_dir = direntry.file_type().expect("valid file info").is_dir();
+        if is_dir {
+            trace!("now analysing files in directory {}", filename);
+        } else {
+            let mat = self.types.matched(
+                direntry.path(),
+                direntry.file_type().expect("valid file info").is_dir(),
+            );
+
+            if let Some(lang_name) = mat
+                .inner()
+                .and_then(|glob| glob.file_type_def())
+                .map(|ftd| ftd.name())
+            {
+                let lang = self.lang_name_to_lang[lang_name];
+
+                trace!("now analysing {}", &filename);
+                match std::fs::read_to_string(direntry.path()) {
+                    Ok(file_contents) => {
+                        let file_results = analyze_file(file_contents.as_str());
+                        if let Some(lang_analysis) = self.dir_results.get_mut(&lang) {
+                            lang_analysis.incorporate(&file_results);
+                        }
+                    }
+                    Err(err) => {
+                        let tip = if filename.len() > 260 {
+                            // path is longer than normal windows limit - long path support might need to be enabled
+                            Some(Cow::from(format!(". NB: path length of {len} is greater than 260 limit; you might need to enable the 'Enable Win32 long paths' group policy setting", len = filename.len())))
+                        } else {
+                            None
+                        };
+                        error!(
+                            "Error failed to analyse file {path}: {err:?}{tip}",
+                            err = err,
+                            tip = tip.unwrap_or(Cow::from("")),
+                            path = filename
+                        );
+                    }
+                }
+            } else {
+                warn!(
+                    "Received file that does not match type filter! {}",
+                    filename
+                )
+            }
+        }
+
+        ignore::WalkState::Continue
+    }
+}
+
+impl<'l> Drop for Analyzer<'l> {
+    fn drop(&mut self) {
+        trace!("Dropping analyzer and combining results");
+        let lock_result = self.final_results.lock();
+        if let Ok(mut results_guard) = lock_result {
+            for (lang, results) in results_guard.iter_mut() {
+                results.incorporate(&self.dir_results[&lang]);
+            }
+        } else {
+            panic!("analyzer sees that mutex for collating results has been poisoned")
+        }
+    }
+}
+
+struct AnalyzerBuilder<'l> {
+    analyzer_prototype: Analyzer<'l>,
+}
+
+impl AnalyzerBuilder<'_> {
+    pub fn new<'l>(
+        langs: &'l Vec<Lang>,
+        types: &ignore::types::Types,
+        final_results: &'l Mutex<HashMap<Lang, Analysis>>,
+    ) -> AnalyzerBuilder<'l> {
+        AnalyzerBuilder {
+            analyzer_prototype: Analyzer {
+                types: types.clone(),
+                langs: langs,
+                lang_name_to_lang: langs
+                    .iter()
+                    .map(|lang| (lang.name.as_str(), lang))
+                    .collect::<HashMap<_, _>>(),
+                dir_results: langs
+                    .clone()
+                    .into_iter()
+                    .map(|lang| (lang, Analysis::new()))
+                    .collect(),
+                final_results: final_results,
+            },
+        }
+    }
+}
+
+impl<'l> ignore::ParallelVisitorBuilder<'l> for AnalyzerBuilder<'l> {
+    fn build(&mut self) -> Box<dyn ignore::ParallelVisitor + 'l> {
+        trace!("Building new analyzer");
+        Box::new(Analyzer {
+            dir_results: self.analyzer_prototype.dir_results.clone(),
+            types: self.analyzer_prototype.types.clone(),
+            lang_name_to_lang: self.analyzer_prototype.lang_name_to_lang.clone(),
+            langs: self.analyzer_prototype.langs,
+            final_results: self.analyzer_prototype.final_results,
+        })
+    }
+}
+
 fn analyze_dir(langs: &Vec<Lang>, dir: &str) -> HashMap<Lang, Analysis> {
-    let lang_name_to_lang: HashMap<&str, &Lang> = langs
-        .iter()
-        .map(|lang| (lang.name.as_str(), lang))
-        .collect::<HashMap<_, _>>();
-
-    let mut dir_results: HashMap<Lang, Analysis> = langs
-        .clone()
-        .into_iter()
-        .map(|lang| (lang, Analysis::new()))
-        .collect();
-
     let mut tb = TypesBuilder::new();
     for lang in langs {
         for glob in &lang.globs {
@@ -193,60 +303,27 @@ fn analyze_dir(langs: &Vec<Lang>, dir: &str) -> HashMap<Lang, Analysis> {
         .build()
         .expect("type builder construction shouldn't fail");
 
-    //TODO build a parallel walker here instead
-    for result in WalkBuilder::new(dir).types(types.clone()).build() {
-        let direntry = result.expect("valid direntry");
-        let filename = unixy_filename_of(&direntry.path());
-        let is_dir = direntry.file_type().expect("valid file info").is_dir();
-        if is_dir {
-            trace!("now analysing files in directory {}", filename);
-            continue;
-        }
+    let dir_results: HashMap<Lang, Analysis> = langs
+        .clone()
+        .into_iter()
+        .map(|lang| (lang, Analysis::new()))
+        .collect();
 
-        let mat = types.matched(
-            direntry.path(),
-            direntry.file_type().expect("valid file info").is_dir(),
-        );
+    let final_results = std::sync::Mutex::new(dir_results.clone());
 
-        if let Some(lang_name) = mat
-            .inner()
-            .and_then(|glob| glob.file_type_def())
-            .map(|ftd| ftd.name())
-        {
-            let lang = lang_name_to_lang[lang_name];
+    let mut analyzer_builder = AnalyzerBuilder::new(&langs, &types, &final_results);
 
-            trace!("now analysing {}", &filename);
-            match std::fs::read_to_string(direntry.path()) {
-                Ok(file_contents) => {
-                    let file_results = analyze_file(file_contents.as_str());
-                    if let Some(lang_analysis) = dir_results.get_mut(&lang) {
-                        lang_analysis.incorporate(&file_results);
-                    }
-                }
-                Err(err) => {
-                    let tip = if filename.len() > 260 {
-                        // path is longer than normal windows limit - long path support might need to be enabled
-                        Some(Cow::from(format!(". NB: path length of {len} is greater than 260 limit; you might need to enable the 'Enable Win32 long paths' group policy setting", len = filename.len())))
-                    } else {
-                        None
-                    };
-                    error!(
-                        "Error failed to analyse file {path}: {err:?}{tip}",
-                        err = err,
-                        tip = tip.unwrap_or(Cow::from("")),
-                        path = filename
-                    );
-                }
-            }
-        } else {
-            warn!(
-                "Received file that does not match type filter! {}",
-                filename
-            )
-        }
+    WalkBuilder::new(dir)
+        .types(types.clone())
+        .build_parallel()
+        .visit(&mut analyzer_builder);
+
+    let lock_result = final_results.lock();
+    if let Ok(results_guard) = lock_result {
+        return results_guard.clone();
+    } else {
+        panic!("main thread sees that mutex for collating results has been poisoned")
     }
-
-    dir_results
 }
 
 fn char_name(c: char) -> String {
@@ -318,6 +395,7 @@ fn main() {
     let results = analyze_dir(&langs, root);
 
     //TODO display aggregate stats for all languages combined
+    trace!("Analysis complete - now showing results");
     for (lang, analysis) in results.iter().filter(|(_l, a)| !a.is_empty()) {
         println!("Language: {}", lang.name);
 
