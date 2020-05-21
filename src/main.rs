@@ -104,10 +104,6 @@ impl Analysis {
     }
 }
 
-fn is_untypeable_char(c: char) -> bool {
-    c == '\r'
-}
-
 fn analyze_file(contents: &str) -> Analysis {
     let mut r = Analysis::new();
 
@@ -116,7 +112,7 @@ fn analyze_file(contents: &str) -> Analysis {
     let mut a = None;
     let mut b = None;
     for mut c in contents.chars() {
-        if is_untypeable_char(c) {
+        if c.is_control() {
             trace!("dropping untypable char: {:?}", c);
             continue;
         }
