@@ -104,40 +104,6 @@ impl Analysis {
     }
 }
 
-fn analyze_file(contents: &str) -> Analysis {
-    let mut r = Analysis::new();
-
-    // a, b, and c are the last 2 chars plus the current one; can't use Rust's iter::window() when
-    // we want to get `char`s rather than bytes, because we can't get a slice of bytes from a str
-    let mut a = None;
-    let mut b = None;
-    for mut c in contents.chars() {
-        if c.is_control() {
-            trace!("dropping untypable char: {:?}", c);
-            continue;
-        }
-
-        // lowercase characters are significantly more common in most programming languages (and
-        // natural languages), so it makes sense to normalize to lowercase rather than uppercase
-        if c.is_ascii_uppercase() {
-            c = c.to_ascii_lowercase();
-        }
-
-        r.record_char(c, 1);
-        if let Some(b) = b {
-            r.record_bigram((b, c), 1);
-            if let Some(a) = a {
-                r.record_trigram((a, b, c), 1);
-            }
-        }
-
-        a = b;
-        b = Some(c);
-    }
-
-    r
-}
-
 #[derive(Debug, Clone)]
 struct Lang {
     name: String,
@@ -174,6 +140,42 @@ struct Analyzer<'l> {
     final_results: &'l Mutex<HashMap<Lang, Analysis>>,
 }
 
+impl Analyzer<'_> {
+    fn analyze_file(contents: &str) -> Analysis {
+        let mut r = Analysis::new();
+
+        // a, b, and c are the last 2 chars plus the current one; can't use Rust's iter::window() when
+        // we want to get `char`s rather than bytes, because we can't get a slice of bytes from a str
+        let mut a = None;
+        let mut b = None;
+        for mut c in contents.chars() {
+            if c.is_control() {
+                trace!("dropping untypable char: {:?}", c);
+                continue;
+            }
+
+            // lowercase characters are significantly more common in most programming languages (and
+            // natural languages), so it makes sense to normalize to lowercase rather than uppercase
+            if c.is_ascii_uppercase() {
+                c = c.to_ascii_lowercase();
+            }
+
+            r.record_char(c, 1);
+            if let Some(b) = b {
+                r.record_bigram((b, c), 1);
+                if let Some(a) = a {
+                    r.record_trigram((a, b, c), 1);
+                }
+            }
+
+            a = b;
+            b = Some(c);
+        }
+
+        r
+    }
+}
+
 impl ignore::ParallelVisitor for Analyzer<'_> {
     fn visit(&mut self, result: Result<ignore::DirEntry, ignore::Error>) -> ignore::WalkState {
         let direntry = result.expect("valid direntry");
@@ -197,7 +199,7 @@ impl ignore::ParallelVisitor for Analyzer<'_> {
                 trace!("now analysing {}", &filename);
                 match std::fs::read_to_string(direntry.path()) {
                     Ok(file_contents) => {
-                        let file_results = analyze_file(file_contents.as_str());
+                        let file_results = Self::analyze_file(file_contents.as_str());
                         if let Some(lang_analysis) = self.dir_results.get_mut(&lang) {
                             lang_analysis.incorporate(&file_results);
                         }
